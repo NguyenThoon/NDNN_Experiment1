@@ -1,0 +1,9 @@
+jax
+jaxlib
+optax
+numpy
+matplotlib
+pandas
+
+# On HPCC/GPU systems, jaxlib may need to be installed with a wheel that
+# matches the available CUDA version and driver stack.
