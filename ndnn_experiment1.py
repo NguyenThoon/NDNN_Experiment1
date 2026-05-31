@@ -75,17 +75,18 @@ def shock_position(params, t):
 
 
 def init_params(seed):
-    keys = jax.random.split(jax.random.PRNGKey(seed), 3)
+    keys = jax.random.split(jax.random.PRNGKey(seed), 4)
     return {
         "minus": init_mlp_params(keys[0], [2, 20, 20, 1]),
         "plus": init_mlp_params(keys[1], [2, 20, 20, 1]),
         "shock": init_mlp_params(keys[2], [1, 20, 20, 1]),
+        "pinn": init_mlp_params(keys[3], [2, 20, 20, 1]),
     }
 
 
 def make_training_points(seed, n_pde, n_rh, n_ic):
     key = jax.random.PRNGKey(seed)
-    key_pde, key_rh, key_ic = jax.random.split(key, 3)
+    key_pde, key_rh, key_ic, key_pinn_pde, key_pinn_ic = jax.random.split(key, 5)
 
     pde_raw = jax.random.uniform(key_pde, (n_pde, 2))
     pde_xi = pde_raw[:, 0]
@@ -94,11 +95,19 @@ def make_training_points(seed, n_pde, n_rh, n_ic):
     rh_t = T_FINAL * jax.random.uniform(key_rh, (n_rh,))
     ic_xi = jax.random.uniform(key_ic, (n_ic,))
 
+    pinn_raw = jax.random.uniform(key_pinn_pde, (n_pde, 2))
+    pinn_x = A + (B - A) * pinn_raw[:, 0]
+    pinn_t = T_FINAL * pinn_raw[:, 1]
+    pinn_ic_x = A + (B - A) * jax.random.uniform(key_pinn_ic, (n_ic,))
+
     return {
         "pde_xi": pde_xi,
         "pde_t": pde_t,
         "rh_t": rh_t,
         "ic_xi": ic_xi,
+        "pinn_x": pinn_x,
+        "pinn_t": pinn_t,
+        "pinn_ic_x": pinn_ic_x,
     }
 
 
@@ -169,12 +178,42 @@ def losses(params, data):
     return total, parts
 
 
+def direct_pinn_losses(pinn_params, data):
+    # Baseline direct PINN: one smooth network over the full space-time domain.
+    res = jax.vmap(lambda x, t: pde_residual(pinn_params, x, t))(data["pinn_x"], data["pinn_t"])
+    loss_pde = jnp.mean(res**2)
+
+    pred0 = jax.vmap(lambda x: solution_net(pinn_params, x, 0.0))(data["pinn_ic_x"])
+    loss_ic = jnp.mean((pred0 - u0(data["pinn_ic_x"])) ** 2)
+
+    total = LAMBDA_PDE * loss_pde + KAPPA_IC * loss_ic
+    parts = {
+        "pinn_loss": total,
+        "pinn_pde": loss_pde,
+        "pinn_ic": loss_ic,
+    }
+    return total, parts
+
+
 def make_train_step(optimizer):
     @jax.jit
     def train_step(params, opt_state, data):
         (loss_value, parts), grads = jax.value_and_grad(losses, has_aux=True)(params, data)
         updates, opt_state_new = optimizer.update(grads, opt_state, params)
         params_new = optax.apply_updates(params, updates)
+        return params_new, opt_state_new, loss_value, parts
+
+    return train_step
+
+
+def make_pinn_train_step(optimizer):
+    @jax.jit
+    def train_step(pinn_params, opt_state, data):
+        (loss_value, parts), grads = jax.value_and_grad(direct_pinn_losses, has_aux=True)(
+            pinn_params, data
+        )
+        updates, opt_state_new = optimizer.update(grads, opt_state, pinn_params)
+        params_new = optax.apply_updates(pinn_params, updates)
         return params_new, opt_state_new, loss_value, parts
 
     return train_step
@@ -194,6 +233,79 @@ def evaluate_solution(params, nx=400, nt=250):
     return np.asarray(x), np.asarray(t), np.asarray(u), np.asarray(shock_x)
 
 
+def evaluate_pinn(pinn_params, x, t):
+    x_jax = jnp.asarray(x)
+    t_jax = jnp.asarray(t)
+
+    def eval_at_time(tt):
+        return jax.vmap(lambda xx: solution_net(pinn_params, xx, tt))(x_jax)
+
+    u = jax.vmap(eval_at_time)(t_jax)
+    return np.asarray(u)
+
+
+def reference_shock_curve(t):
+    """Analytic/numerical reference shock curve for Experiment 1."""
+    t = np.asarray(t)
+    gamma = np.zeros_like(t, dtype=np.float64)
+
+    def speed(g, tt):
+        u_minus = 1.0 - (g + 2.0) / (8.0 * tt)
+        u_plus = 1.5
+        return (flux_np(u_plus) - flux_np(u_minus)) / (u_plus - u_minus)
+
+    order = np.argsort(t)
+    current_t = 0.5
+    current_g = 0.0
+
+    for idx in order:
+        target_t = t[idx]
+        if target_t <= 0.5:
+            gamma[idx] = 0.0
+            continue
+
+        steps = max(1, int(np.ceil((target_t - current_t) / 1e-3)))
+        dt = (target_t - current_t) / steps
+        for _ in range(steps):
+            k1 = speed(current_g, current_t)
+            k2 = speed(current_g + 0.5 * dt * k1, current_t + 0.5 * dt)
+            k3 = speed(current_g + 0.5 * dt * k2, current_t + 0.5 * dt)
+            k4 = speed(current_g + dt * k3, current_t + dt)
+            current_g += dt * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+            current_t += dt
+        gamma[idx] = current_g
+
+    return gamma
+
+
+def flux_np(u):
+    return 4.0 * u * (2.0 - u)
+
+
+def reference_solution(x, t):
+    x = np.asarray(x)
+    t = np.asarray(t)
+    gamma = reference_shock_curve(t)
+    u = np.empty((len(t), len(x)), dtype=np.float64)
+
+    for i, (tt, gg) in enumerate(zip(t, gamma)):
+        if tt == 0.0:
+            u[i] = np.where(x < -2.0, 1.0, np.where(x < 0.0, 0.5, 1.5))
+        elif tt <= 0.5:
+            rare_right = -2.0 + 4.0 * tt
+            rare = 1.0 - (x + 2.0) / (8.0 * tt)
+            u[i] = np.where(
+                x < -2.0,
+                1.0,
+                np.where(x <= rare_right, rare, np.where(x < 0.0, 0.5, 1.5)),
+            )
+        else:
+            rare = 1.0 - (x + 2.0) / (8.0 * tt)
+            u[i] = np.where(x < -2.0, 1.0, np.where(x <= gg, rare, 1.5))
+
+    return u, gamma
+
+
 def save_loss_history(path, history):
     fieldnames = [
         "epoch",
@@ -205,6 +317,9 @@ def save_loss_history(path, history):
         "ic",
         "ic_minus",
         "ic_plus",
+        "pinn_loss",
+        "pinn_pde",
+        "pinn_ic",
     ]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -212,7 +327,7 @@ def save_loss_history(path, history):
         writer.writerows(history)
 
 
-def plot_outputs(outdir, x, t, u, shock_x):
+def plot_outputs(outdir, x, t, u, shock_x, u_ref, ref_shock_x, u_pinn):
     loss_df = pd.read_csv(os.path.join(outdir, "loss_history.csv"))
 
     plt.figure(figsize=(7, 4))
@@ -235,6 +350,54 @@ def plot_outputs(outdir, x, t, u, shock_x):
     plt.legend(loc="upper right")
     plt.tight_layout()
     plt.savefig(os.path.join(outdir, "plot_solution_ndnn.png"), dpi=200)
+    plt.close()
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 3.8), sharex=True, sharey=True)
+    panels = [
+        ("NDNN solution", u, shock_x),
+        ("Solution of reference", u_ref, ref_shock_x),
+        ("Direct PINN solution", u_pinn, None),
+    ]
+    vmin = min(np.nanmin(u), np.nanmin(u_ref), np.nanmin(u_pinn))
+    vmax = max(np.nanmax(u), np.nanmax(u_ref), np.nanmax(u_pinn))
+    image = None
+    for ax, (title, values, curve) in zip(axes, panels):
+        image = ax.imshow(
+            values,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap="viridis",
+            vmin=vmin,
+            vmax=vmax,
+        )
+        if curve is not None:
+            ax.plot(curve, t, "w-", linewidth=1.5)
+        ax.set_title(title)
+        ax.set_xlabel("x")
+    axes[0].set_ylabel("t")
+    fig.colorbar(image, ax=axes, label="u(x,t)", shrink=0.9)
+    fig.savefig(os.path.join(outdir, "plot_exp1_paper_comparison.png"), dpi=200)
+    plt.close(fig)
+
+    plt.figure(figsize=(8, 4.5))
+    plt.imshow(u_ref, origin="lower", aspect="auto", extent=extent, cmap="viridis")
+    plt.colorbar(label="u_ref(x,t)")
+    plt.plot(ref_shock_x, t, "w-", linewidth=2.0, label="reference shock")
+    plt.xlabel("x")
+    plt.ylabel("t")
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "plot_solution_reference.png"), dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(8, 4.5))
+    plt.imshow(u_pinn, origin="lower", aspect="auto", extent=extent, cmap="viridis")
+    plt.colorbar(label="u_pinn(x,t)")
+    plt.xlabel("x")
+    plt.ylabel("t")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "plot_solution_direct_pinn.png"), dpi=200)
     plt.close()
 
     plt.figure(figsize=(5, 4))
@@ -265,9 +428,12 @@ def main():
 
     params = init_params(args.seed)
     data = make_training_points(args.seed + 1234, args.n_pde, args.n_rh, args.n_ic)
+    pinn_params = params.pop("pinn")
     optimizer = optax.adam(args.lr)
     opt_state = optimizer.init(params)
     train_step = make_train_step(optimizer)
+    pinn_opt_state = optimizer.init(pinn_params)
+    pinn_train_step = make_pinn_train_step(optimizer)
 
     log_every = 500
     history = []
@@ -281,14 +447,19 @@ def main():
 
     for epoch in range(args.epochs + 1):
         params, opt_state, loss_value, parts = train_step(params, opt_state, data)
+        pinn_params, pinn_opt_state, _, pinn_parts = pinn_train_step(
+            pinn_params, pinn_opt_state, data
+        )
 
         if epoch % log_every == 0 or epoch == args.epochs:
             row = {"epoch": epoch}
             row.update({key: float(value) for key, value in parts.items()})
+            row.update({key: float(value) for key, value in pinn_parts.items()})
             history.append(row)
             print(
                 f"epoch {epoch:7d} | loss={row['loss']:.6e} | "
-                f"pde={row['pde']:.6e} | rh={row['rh']:.6e} | ic={row['ic']:.6e}"
+                f"pde={row['pde']:.6e} | rh={row['rh']:.6e} | "
+                f"ic={row['ic']:.6e} | pinn={row['pinn_loss']:.6e}"
             )
 
     save_loss_history(os.path.join(args.outdir, "loss_history.csv"), history)
@@ -296,10 +467,22 @@ def main():
     x, t, u, shock_x = evaluate_solution(params)
     np.savez(os.path.join(args.outdir, "solution_grid.npz"), x=x, t=t, u=u, shock_x=shock_x)
 
+    u_ref, ref_shock_x = reference_solution(x, t)
+    np.savez(
+        os.path.join(args.outdir, "reference_solution_grid.npz"),
+        x=x,
+        t=t,
+        u=u_ref,
+        shock_x=ref_shock_x,
+    )
+
+    u_pinn = evaluate_pinn(pinn_params, x, t)
+    np.savez(os.path.join(args.outdir, "direct_pinn_grid.npz"), x=x, t=t, u=u_pinn)
+
     shock_df = pd.DataFrame({"t": t, "n": shock_x})
     shock_df.to_csv(os.path.join(args.outdir, "shock_curve.csv"), index=False)
 
-    plot_outputs(args.outdir, x, t, u, shock_x)
+    plot_outputs(args.outdir, x, t, u, shock_x, u_ref, ref_shock_x, u_pinn)
     print("Done.")
 
 
