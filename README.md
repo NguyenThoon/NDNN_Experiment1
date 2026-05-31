@@ -58,8 +58,8 @@ method as needed for the specific cluster environment.
 - `reference_solution_grid.npz`: analytic/reference Experiment 1 solution on the
   same plotting grid.
 - `direct_pinn_grid.npz`: direct single-network PINN baseline on the same grid.
-- `plot_loss.png`: semilog plot of total, PDE, Rankine-Hugoniot, and initial
-  condition losses.
+- `plot_loss.png`: paper-style semilog plot of the total NDNN loss with circular
+  markers.
 - `plot_solution_ndnn.png`: heat map of the learned piecewise solution with the
   learned shock overlaid.
 - `plot_solution_reference.png`: heat map of the analytic/reference solution.

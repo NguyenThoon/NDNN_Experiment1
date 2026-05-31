@@ -330,12 +330,19 @@ def save_loss_history(path, history):
 def plot_outputs(outdir, x, t, u, shock_x, u_ref, ref_shock_x, u_pinn):
     loss_df = pd.read_csv(os.path.join(outdir, "loss_history.csv"))
 
-    plt.figure(figsize=(7, 4))
-    for col in ["loss", "pde", "rh", "ic"]:
-        plt.semilogy(loss_df["epoch"], loss_df[col], label=col)
+    plt.figure(figsize=(5.5, 4))
+    plt.semilogy(
+        loss_df["epoch"],
+        loss_df["loss"],
+        "o-",
+        markersize=4,
+        linewidth=1.5,
+        markerfacecolor="none",
+        label="loss",
+    )
     plt.xlabel("epoch")
     plt.ylabel("loss")
-    plt.legend()
+    plt.grid(True, which="both", linewidth=0.4, alpha=0.35)
     plt.tight_layout()
     plt.savefig(os.path.join(outdir, "plot_loss.png"), dpi=200)
     plt.close()
