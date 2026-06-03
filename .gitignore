@@ -1,0 +1,8 @@
+.venv/
+runs/
+__pycache__/
+*.pyc
+*.out
+slurm-*.out
+
+
