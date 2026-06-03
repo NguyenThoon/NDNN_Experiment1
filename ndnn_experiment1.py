@@ -1,8 +1,7 @@
 """Experiment 1: one-shock NDNN for a scalar conservation law.
 
-This script implements the Section 2.1 one-shock formulation from
-"Non-diffusive neural network method for hyperbolic conservation laws" in a
-compact, reproducible JAX/Optax training loop.
+This is a compact JAX/Optax training script for the Section 2.1 setup in
+"Non-diffusive neural network method for hyperbolic conservation laws."
 """
 
 import argparse
@@ -120,7 +119,7 @@ def t_plus_x(shock_x, xi):
 
 
 def pde_residual(net_params, x, t):
-    # Physical residual: d_t N(x,t) + d_x f(N(x,t)).
+    # Conservation-law residual in physical coordinates.
     dt_n = jax.grad(lambda tau: solution_net(net_params, x, tau))(t)
     dx_flux = jax.grad(lambda y: flux(solution_net(net_params, y, t)))(x)
     return dt_n + dx_flux
@@ -136,14 +135,14 @@ def losses(params, data):
     x_minus = t_minus_x(shock_at_pde, pde_xi)
     x_plus = t_plus_x(shock_at_pde, pde_xi)
 
-    # PDE losses in the mapped left and right physical subdomains.
+    # Residuals on the mapped left and right subdomains.
     res_minus = jax.vmap(lambda x, t: pde_residual(params["minus"], x, t))(x_minus, pde_t)
     res_plus = jax.vmap(lambda x, t: pde_residual(params["plus"], x, t))(x_plus, pde_t)
     loss_pde_minus = jnp.mean(res_minus**2)
     loss_pde_plus = jnp.mean(res_plus**2)
     loss_pde = loss_pde_minus + loss_pde_plus
 
-    # Rankine-Hugoniot loss along x=n(t).
+    # Rankine-Hugoniot residual along x=n(t).
     def rh_residual(t):
         sx = shock_position(params["shock"], t)
         st = jax.grad(lambda tau: shock_position(params["shock"], tau))(t)
@@ -154,8 +153,7 @@ def losses(params, data):
     rh = jax.vmap(rh_residual)(rh_t)
     loss_rh = jnp.mean(rh**2)
 
-    # Initial data on T_minus(xi,0) and T_plus(xi,0). Since n(0)=0, these
-    # intervals are (-4,0) and (0,1), respectively.
+    # Since n(0)=0, the two initial intervals are (-4,0) and (0,1).
     x0_minus = t_minus_x(0.0, ic_xi)
     x0_plus = t_plus_x(0.0, ic_xi)
     pred0_minus = jax.vmap(lambda x: solution_net(params["minus"], x, 0.0))(x0_minus)
@@ -179,7 +177,7 @@ def losses(params, data):
 
 
 def direct_pinn_losses(pinn_params, data):
-    # Baseline direct PINN: one smooth network over the full space-time domain.
+    # Direct PINN baseline: one smooth network on the full domain.
     res = jax.vmap(lambda x, t: pde_residual(pinn_params, x, t))(data["pinn_x"], data["pinn_t"])
     loss_pde = jnp.mean(res**2)
 
@@ -245,7 +243,7 @@ def evaluate_pinn(pinn_params, x, t):
 
 
 def reference_shock_curve(t):
-    """Analytic/numerical reference shock curve for Experiment 1."""
+    """Reference shock curve used for the Experiment 1 comparison."""
     t = np.asarray(t)
     gamma = np.zeros_like(t, dtype=np.float64)
 
