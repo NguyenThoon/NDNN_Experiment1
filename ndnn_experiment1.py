@@ -10,11 +10,13 @@ import os
 
 import jax
 
+# Enable double precision for the JAX computations.
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 import matplotlib
 
+# Use non-interactive backend for plotting in scripts.
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
@@ -23,6 +25,7 @@ import optax
 import pandas as pd
 
 
+# Domain and training constants for Experiment 1.
 A = -4.0
 B = 1.0
 T_FINAL = 0.75
@@ -32,14 +35,17 @@ KAPPA_IC = 1.0
 
 
 def flux(u):
+    """Flux function for the scalar conservation law."""
     return 4.0 * u * (2.0 - u)
 
 
 def u0(x):
+    """Initial condition for the piecewise constant initial state."""
     return jnp.where(x < -2.0, 1.0, jnp.where(x < 0.0, 0.5, 1.5))
 
 
 def init_mlp_params(key, layer_sizes):
+    """Initialize a fully connected neural network with Glorot uniform weights."""
     params = []
     keys = jax.random.split(key, len(layer_sizes) - 1)
     for subkey, in_dim, out_dim in zip(keys, layer_sizes[:-1], layer_sizes[1:]):
@@ -52,6 +58,10 @@ def init_mlp_params(key, layer_sizes):
 
 
 def mlp_apply(params, inputs):
+    """Evaluate the MLP on the given inputs.
+
+    The network uses tanh activations for all hidden layers and a linear output.
+    """
     z = inputs
     for w, b in params[:-1]:
         z = jnp.tanh(z @ w + b)
@@ -60,20 +70,24 @@ def mlp_apply(params, inputs):
 
 
 def solution_net(params, x, t):
+    """Evaluate the solution network at a single point (x, t)."""
     inputs = jnp.stack([x, t])
     return mlp_apply(params, inputs).squeeze()
 
 
 def raw_shock_net(params, t):
+    """Evaluate the shock parametrization network at time t."""
     inputs = jnp.array([t])
     return mlp_apply(params, inputs).squeeze()
 
 
 def shock_position(params, t):
+    """Compute the shock location n(t) from the raw shock network."""
     return t * raw_shock_net(params, t)
 
 
 def init_params(seed):
+    """Initialize all neural network parameters for the experiment."""
     keys = jax.random.split(jax.random.PRNGKey(seed), 4)
     return {
         "minus": init_mlp_params(keys[0], [2, 20, 20, 1]),
@@ -84,16 +98,21 @@ def init_params(seed):
 
 
 def make_training_points(seed, n_pde, n_rh, n_ic):
+    """Generate random training points for PDE, RH, IC, and PINN losses."""
     key = jax.random.PRNGKey(seed)
     key_pde, key_rh, key_ic, key_pinn_pde, key_pinn_ic = jax.random.split(key, 5)
 
+    # PDE residual points in (xi, t) with xi in [0,1] and t in [0,T_FINAL].
     pde_raw = jax.random.uniform(key_pde, (n_pde, 2))
     pde_xi = pde_raw[:, 0]
     pde_t = T_FINAL * pde_raw[:, 1]
 
+    # Shock condition times randomly sampled in [0, T_FINAL].
     rh_t = T_FINAL * jax.random.uniform(key_rh, (n_rh,))
+    # Initial-condition sampling coordinates in the unit interval for mapped subdomains.
     ic_xi = jax.random.uniform(key_ic, (n_ic,))
 
+    # PINN baseline uses direct x,t samples on the full domain.
     pinn_raw = jax.random.uniform(key_pinn_pde, (n_pde, 2))
     pinn_x = A + (B - A) * pinn_raw[:, 0]
     pinn_t = T_FINAL * pinn_raw[:, 1]
@@ -111,38 +130,42 @@ def make_training_points(seed, n_pde, n_rh, n_ic):
 
 
 def t_minus_x(shock_x, xi):
+    """Map unit interval xi to the left subdomain x in [A, shock_x]."""
     return (shock_x - A) * xi + A
 
 
 def t_plus_x(shock_x, xi):
+    """Map unit interval xi to the right subdomain x in [shock_x, B]."""
     return (B - shock_x) * xi + shock_x
 
 
 def pde_residual(net_params, x, t):
-    # Conservation-law residual in physical coordinates.
+    """Compute the conservation-law residual dt u + dx flux(u)."""
     dt_n = jax.grad(lambda tau: solution_net(net_params, x, tau))(t)
     dx_flux = jax.grad(lambda y: flux(solution_net(net_params, y, t)))(x)
     return dt_n + dx_flux
 
 
 def losses(params, data):
+    """Compute the total NDNN loss and its individual components."""
     pde_xi = data["pde_xi"]
     pde_t = data["pde_t"]
     rh_t = data["rh_t"]
     ic_xi = data["ic_xi"]
 
+    # Compute the current shock location for each PDE training time.
     shock_at_pde = jax.vmap(lambda tt: shock_position(params["shock"], tt))(pde_t)
     x_minus = t_minus_x(shock_at_pde, pde_xi)
     x_plus = t_plus_x(shock_at_pde, pde_xi)
 
-    # Residuals on the mapped left and right subdomains.
+    # PDE residuals on the left and right subdomains separately.
     res_minus = jax.vmap(lambda x, t: pde_residual(params["minus"], x, t))(x_minus, pde_t)
     res_plus = jax.vmap(lambda x, t: pde_residual(params["plus"], x, t))(x_plus, pde_t)
     loss_pde_minus = jnp.mean(res_minus**2)
     loss_pde_plus = jnp.mean(res_plus**2)
     loss_pde = loss_pde_minus + loss_pde_plus
 
-    # Rankine-Hugoniot residual along x=n(t).
+    # Rankine-Hugoniot residual ensures the shock jump condition holds at the interface.
     def rh_residual(t):
         sx = shock_position(params["shock"], t)
         st = jax.grad(lambda tau: shock_position(params["shock"], tau))(t)
@@ -153,7 +176,7 @@ def losses(params, data):
     rh = jax.vmap(rh_residual)(rh_t)
     loss_rh = jnp.mean(rh**2)
 
-    # Since n(0)=0, the two initial intervals are (-4,0) and (0,1).
+    # Enforce initial conditions at t=0 on both sides of the shock.
     x0_minus = t_minus_x(0.0, ic_xi)
     x0_plus = t_plus_x(0.0, ic_xi)
     pred0_minus = jax.vmap(lambda x: solution_net(params["minus"], x, 0.0))(x0_minus)
@@ -177,7 +200,7 @@ def losses(params, data):
 
 
 def direct_pinn_losses(pinn_params, data):
-    # Direct PINN baseline: one smooth network on the full domain.
+    """Compute the loss for the direct PINN baseline on the full domain."""
     res = jax.vmap(lambda x, t: pde_residual(pinn_params, x, t))(data["pinn_x"], data["pinn_t"])
     loss_pde = jnp.mean(res**2)
 
@@ -194,6 +217,7 @@ def direct_pinn_losses(pinn_params, data):
 
 
 def make_train_step(optimizer):
+    """Create a JIT-compiled training step for the NDNN model."""
     @jax.jit
     def train_step(params, opt_state, data):
         (loss_value, parts), grads = jax.value_and_grad(losses, has_aux=True)(params, data)
@@ -205,6 +229,7 @@ def make_train_step(optimizer):
 
 
 def make_pinn_train_step(optimizer):
+    """Create a JIT-compiled training step for the direct PINN baseline."""
     @jax.jit
     def train_step(pinn_params, opt_state, data):
         (loss_value, parts), grads = jax.value_and_grad(direct_pinn_losses, has_aux=True)(
@@ -218,6 +243,7 @@ def make_pinn_train_step(optimizer):
 
 
 def evaluate_solution(params, nx=400, nt=250):
+    """Evaluate the learned NDNN solution on a space-time grid."""
     x = jnp.linspace(A, B, nx)
     t = jnp.linspace(0.0, T_FINAL, nt)
     shock_x = jax.vmap(lambda tt: shock_position(params["shock"], tt))(t)
@@ -232,6 +258,7 @@ def evaluate_solution(params, nx=400, nt=250):
 
 
 def evaluate_pinn(pinn_params, x, t):
+    """Evaluate the direct PINN solution on the same grid for comparison."""
     x_jax = jnp.asarray(x)
     t_jax = jnp.asarray(t)
 
@@ -243,7 +270,7 @@ def evaluate_pinn(pinn_params, x, t):
 
 
 def reference_shock_curve(t):
-    """Reference shock curve used for the Experiment 1 comparison."""
+    """Compute the reference shock curve using the analytic ODE solver."""
     t = np.asarray(t)
     gamma = np.zeros_like(t, dtype=np.float64)
 
@@ -277,10 +304,12 @@ def reference_shock_curve(t):
 
 
 def flux_np(u):
+    """NumPy version of the flux function for reference solution generation."""
     return 4.0 * u * (2.0 - u)
 
 
 def reference_solution(x, t):
+    """Build the analytic reference solution on a grid of x and t values."""
     x = np.asarray(x)
     t = np.asarray(t)
     gamma = reference_shock_curve(t)
@@ -305,6 +334,7 @@ def reference_solution(x, t):
 
 
 def save_loss_history(path, history):
+    """Save the training loss history to a CSV file."""
     fieldnames = [
         "epoch",
         "loss",
@@ -326,6 +356,7 @@ def save_loss_history(path, history):
 
 
 def plot_outputs(outdir, x, t, u, shock_x, u_ref, ref_shock_x, u_pinn):
+    """Save diagnostic plots for losses, learned solution, and comparisons."""
     loss_df = pd.read_csv(os.path.join(outdir, "loss_history.csv"))
 
     plt.figure(figsize=(5.5, 4))
@@ -416,6 +447,7 @@ def plot_outputs(outdir, x, t, u, shock_x, u_ref, ref_shock_x, u_pinn):
 
 
 def parse_args():
+    """Parse command-line arguments for experiment configuration."""
     parser = argparse.ArgumentParser(description="One-shock NDNN Experiment 1")
     parser.add_argument("--epochs", type=int, default=50000)
     parser.add_argument("--n-pde", type=int, default=2500)
@@ -428,6 +460,7 @@ def parse_args():
 
 
 def main():
+    """Run the full training, evaluation, and plotting workflow."""
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
